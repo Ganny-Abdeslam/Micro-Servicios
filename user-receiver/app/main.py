@@ -1,64 +1,53 @@
 # user-receiver/app/main.py
 import os
 import json
+import asyncio
 from datetime import datetime
-from typing import Literal, Dict
-
-import aio_pika
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, EmailStr, Field
+from typing import Dict, Any
 import logging
 
+import aio_pika
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("orchestrator")
+logger = logging.getLogger("orchestrator_consumer")
 
-# Config desde env
+# Config desde env (ajusta nombres si lo prefieres)
 RABBIT_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbit:5672/")
-EXCHANGE = os.getenv("EXCHANGE", "messaging.events")   # exchange donde publicar el correo listo
-ROUTING_KEY = os.getenv("ROUTING_KEY", "messaging.send")  # routing key para que messaging lo consuma
+SOURCE_EXCHANGE = os.getenv("SOURCE_EXCHANGE", "user.events")   # exchange donde publica user-service
+SOURCE_BINDING = os.getenv("SOURCE_BINDING", "user.#")         # binding key para recibir eventos user.*
+TARGET_EXCHANGE = os.getenv("EXCHANGE", "messaging.events")    # exchange al que publicamos el correo listo
+TARGET_ROUTING_KEY = os.getenv("ROUTING_KEY", "messaging.send")
 
-# Acciones permitidas
-ActionLiteral = Literal["registrar", "autenticacion", "recuperacion_claves", "actualizacion_claves"]
+QUEUE_NAME = os.getenv("QUEUE_NAME", "orchestrator.user.events")
 
-class UserIn(BaseModel):
-    nombre: str
-    apellido: str
-    correo: EmailStr
-    numero: str = Field(..., alias="número")
-    tipo: str
-    accion: ActionLiteral = Field(..., alias="acción")
-
-    class Config:
-        allow_population_by_field_name = True
-        extra = "allow"
-
+# Mapeo acción -> asunto y cuerpo (puedes extender)
 SUBJECTS: Dict[str, str] = {
-    "registrar": "Registro completado",
-    "autenticacion": "Notificación de autenticación",
-    "recuperacion_claves": "Solicitud de recuperación de claves",
-    "actualizacion_claves": "Actualización de claves realizada",
+    "user.registered": "Registro completado",
+    "user.login": "Notificación de autenticación",
+    "user.recovery.link": "Solicitud de recuperación de claves",
+    "user.password.updated": "Actualización de claves realizada",
 }
 
 BODIES: Dict[str, str] = {
-    "registrar": (
+    "user.registered": (
         "Hola {full_name},\n\n"
         "Gracias por registrarte en nuestro sistema. Tu cuenta ha sido creada correctamente.\n\n"
         "Si tienes alguna duda, responde a este correo.\n\n"
         "Saludos,\nEl equipo"
     ),
-    "autenticacion": (
+    "user.login": (
         "Hola {full_name},\n\n"
         "Se ha detectado una autenticación en tu cuenta. Si fuiste tú, ignora este mensaje. "
         "Si no reconoces esta actividad, por favor contacta soporte inmediatamente.\n\n"
         "Saludos,\nEl equipo"
     ),
-    "recuperacion_claves": (
+    "user.recovery.link": (
         "Hola {full_name},\n\n"
         "Hemos recibido una solicitud para recuperar tu contraseña. Si fuiste tú, sigue las instrucciones "
         "en la plataforma para restablecerla. Si no solicitaste esto, ignora el mensaje.\n\n"
         "Saludos,\nEl equipo"
     ),
-    "actualizacion_claves": (
+    "user.password.updated": (
         "Hola {full_name},\n\n"
         "Te confirmamos que la contraseña asociada a tu cuenta ha sido actualizada correctamente. "
         "Si no realizaste este cambio, contacta soporte de inmediato.\n\n"
@@ -66,81 +55,90 @@ BODIES: Dict[str, str] = {
     ),
 }
 
-app = FastAPI(title="orchestrator")
-
-# RabbitMQ globals
-rabbit_conn: aio_pika.RobustConnection | None = None
-rabbit_channel: aio_pika.RobustChannel | None = None
-exchange: aio_pika.Exchange | None = None
-
-@app.on_event("startup")
-async def startup():
-    global rabbit_conn, rabbit_channel, exchange
-    logger.info("Conectando a RabbitMQ en %s", RABBIT_URL)
-    rabbit_conn = await aio_pika.connect_robust(RABBIT_URL)
-    rabbit_channel = await rabbit_conn.channel()
-    exchange = await rabbit_channel.declare_exchange(EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True)
-    logger.info("Exchange declarado: %s (rk=%s)", EXCHANGE, ROUTING_KEY)
-
-@app.on_event("shutdown")
-async def shutdown():
-    global rabbit_channel, rabbit_conn
-    logger.info("Cerrando conexión RabbitMQ")
-    if rabbit_channel:
-        await rabbit_channel.close()
-    if rabbit_conn:
-        await rabbit_conn.close()
-
 def render_subject(action: str) -> str:
     return SUBJECTS.get(action, f"Notificación: {action}")
 
 def render_body(action: str, full_name: str) -> str:
-    template = BODIES.get(action)
-    if template:
-        return template.format(full_name=full_name)
+    tpl = BODIES.get(action)
+    if tpl:
+        return tpl.format(full_name=full_name)
     return f"Hola {full_name},\n\nSe ha producido la acción: {action}.\n\nSaludos,\nEl equipo"
 
-@app.post("/users", status_code=202)
-async def receive_user(payload: dict):
+async def start_consumer():
+    logger.info("Conectando a RabbitMQ %s", RABBIT_URL)
+    connection = await aio_pika.connect_robust(RABBIT_URL)
+    channel = await connection.channel()
+    await channel.set_qos(prefetch_count=1)
+
+    # Declarar exchange origen (topic) - asegúrate que el publisher use el mismo exchange
+    source_ex = await channel.declare_exchange(SOURCE_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True)
+    # Declarar exchange destino donde publicar el correo listo
+    target_ex = await channel.declare_exchange(TARGET_EXCHANGE, aio_pika.ExchangeType.TOPIC, durable=True)
+
+    # Declarar cola y bind
+    queue = await channel.declare_queue(QUEUE_NAME, durable=True)
+    await queue.bind(source_ex, SOURCE_BINDING)
+
+    logger.info("Esperando mensajes en queue=%s binding=%s", QUEUE_NAME, SOURCE_BINDING)
+
+    async def handle(message: aio_pika.IncomingMessage):
+        async with message.process(requeue=False):
+            try:
+                raw = message.body.decode("utf-8")
+                event = json.loads(raw)
+                logger.info("Evento recibido: %s", event.get("action"))
+
+                # Estructura esperada: { "action": "...", "user": { id, name, lastName, email, phone }, "timestamp": ... }
+                action = event.get("action") or event.get("accion") or event.get("type")
+                user_obj = event.get("user") or event.get("usuario") or {}
+
+                # seguridad: normalizar nombres de campo del publisher Go
+                name = user_obj.get("name") or user_obj.get("nombre") or user_obj.get("firstName") or ""
+                last_name = user_obj.get("lastName") or user_obj.get("apellido") or user_obj.get("last_name") or ""
+                email = user_obj.get("email") or user_obj.get("correo")
+                phone = user_obj.get("phone") or user_obj.get("phoneNumber") or user_obj.get("telefono") or ""
+
+                full_name = f"{name} {last_name}".strip()
+
+                # Construir email listo
+                subject = render_subject(action or "unknown")
+                body = render_body(action or "unknown", full_name)
+                message_payload = {
+                    "email": email,
+                    "affair": subject,
+                    "body": body,
+                    "number": phone,
+                    "meta": {
+                        "id": user_obj.get("id"),
+                        "name": name,
+                        "lastName": last_name,
+                        "email": email,
+                        "phone": phone,
+                        "action": action,
+                        "timestamp": event.get("timestamp") or datetime.utcnow().isoformat() + "Z",
+                        "receivedAt": datetime.utcnow().isoformat() + "Z"
+                    }
+                }
+
+                # publicar en exchange destino con routing key TARGET_ROUTING_KEY
+                msg = aio_pika.Message(
+                    body=json.dumps(message_payload, ensure_ascii=False).encode("utf-8"),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                )
+                await target_ex.publish(msg, routing_key=TARGET_ROUTING_KEY)
+                logger.info("Publicado mensaje a %s (routing=%s) para=%s action=%s", TARGET_EXCHANGE, TARGET_ROUTING_KEY, email, action)
+            except Exception as e:
+                logger.exception("Error procesando evento: %s", e)
+                # si hay error grave, no reenviamos (evita loops), pero podrías ch.nack con requeue=True
+                return
+
+    await queue.consume(handle, no_ack=False)
+    # Mantener corriendo
     try:
-        user = UserIn.model_validate(payload)
-    except Exception as exc:
-        logger.warning("Payload inválido: %s", exc)
-        raise HTTPException(status_code=400, detail={"error": "payload inválido", "details": str(exc)})
+        await asyncio.Future()
+    finally:
+        await channel.close()
+        await connection.close()
 
-    # Construir datos
-    full_name = f"{user.nombre} {user.apellido}"
-    action_alias = user.model_dump(by_alias=True).get("acción")
-    para = str(user.correo)
-    asunto = render_subject(action_alias)
-    cuerpo = render_body(action_alias, full_name)
-
-    message = {
-        "para": para,
-        "asunto": asunto,
-        "cuerpo": cuerpo,
-        "meta": {
-            "nombre": user.nombre,
-            "apellido": user.apellido,
-            "correo": str(user.correo),
-            "número": user.model_dump(by_alias=True).get("número"),
-            "tipo": user.tipo,
-            "acción": action_alias,
-            "recibidoAt": datetime.utcnow().isoformat() + "Z"
-        }
-    }
-
-    # Publicar mensaje listo para envío
-    try:
-        if not exchange:
-            raise RuntimeError("Exchange no disponible")
-        msg = aio_pika.Message(
-            body=json.dumps(message, ensure_ascii=False).encode("utf-8"),
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
-        )
-        await exchange.publish(msg, routing_key=ROUTING_KEY)
-        logger.info("Publicado correo listo -> para=%s asunto=%s action=%s", para, asunto, action_alias)
-        return {"status": "published", "para": para, "asunto": asunto}
-    except Exception as e:
-        logger.exception("Error publicando en RabbitMQ: %s", e)
-        raise HTTPException(status_code=500, detail="error publicando en broker")
+if __name__ == "__main__":
+    asyncio.run(start_consumer())

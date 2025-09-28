@@ -19,10 +19,3 @@ services:
       - rabbit
     ports:
       - "3000:3000"
-
-  messaging:
-    build: ./messaging
-    environment:
-      RABBITMQ_URL: "amqp://guest:guest@rabbit:5672/"
-    depends_on:
-      - rabbit
