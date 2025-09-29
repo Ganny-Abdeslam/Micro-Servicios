@@ -1,7 +1,8 @@
 aio-pika==9.4.1
-aiormq==6.7.7
+aiormq==6.8.1
 pamqp==3.3.0
 
 pytest==8.3.3
 pytest-asyncio==0.23.7
 pytest-mock==3.14.0
+uvicorn[standard]   
