@@ -64,9 +64,25 @@ def render_body(action: str, full_name: str) -> str:
         return tpl.format(full_name=full_name)
     return f"Hola {full_name},\n\nSe ha producido la acción: {action}.\n\nSaludos,\nEl equipo"
 
+async def connect_with_retry(url: str, max_retries: int = 10, delay_seconds: int = 3) -> aio_pika.RobustConnection:
+    last_exception = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info("🔁 Intento %d: conectando a RabbitMQ en %s", attempt, url)
+            connection = await aio_pika.connect_robust(url)
+            logger.info("✅ Conectado a RabbitMQ en el intento %d", attempt)
+            return connection
+        except Exception as e:
+            logger.warning("⚠️  Fallo intento %d de conexión a RabbitMQ: %s", attempt, e)
+            last_exception = e
+            await asyncio.sleep(delay_seconds)
+
+    logger.error("❌ No se pudo conectar a RabbitMQ después de %d intentos", max_retries)
+    raise last_exception
+
 async def start_consumer():
     logger.info("Conectando a RabbitMQ %s", RABBIT_URL)
-    connection = await aio_pika.connect_robust(RABBIT_URL)
+    connection = await connect_with_retry(RABBIT_URL)
     channel = await connection.channel()
     await channel.set_qos(prefetch_count=1)
 
